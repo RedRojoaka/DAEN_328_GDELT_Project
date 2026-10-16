@@ -7,4 +7,3 @@ __pycache__/
 .DS_Store
 bigquery-key.json
 *-service-account*.json
-*.db
