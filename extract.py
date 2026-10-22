@@ -9,14 +9,24 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import json 
 
+
+########################################################## NOTES ##########################################################
+
+#! LOOKBACK_DAYS will need to be edited as needed and put in env
+#! occasionally there are updates such as "50 files loaded", these will need to be scaled up as needed
+#! please please please feel free to lmk what changes should be made; im not the most confident in this code so any suggestions are great
+
+###########################################################################################################################
+
 # using env folder
 load_dotenv()
 
-# local variables
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "1"))
+# variables
+LOOKBACK_DAYS = 1 
 LASTUPDATE_URL = "https://data.gdeltproject.org/gdeltv2/lastupdate.txt"      # always updates with the last updated files
 MASTER_LIST_URL = "https://data.gdeltproject.org/gdeltv2/masterfilelist.txt" # every file
-RAW_DIR = "data" 
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+RAW_DIR = os.path.join(PROJECT_DIR, "data") 
 RAW_FILE = os.path.join(RAW_DIR, "gdelt_events_raw.csv")
 STATE_FILE = os.path.join(RAW_DIR, "extract_state.json")
 EVENT_COLUMNS = [
@@ -46,8 +56,6 @@ EVENT_COLUMNS = [
 
 
 def get_lastupdate_timestamp():
-    """Gets the timestamp of the file in the LASTUPDATE_URL"""
-
     try:
         response = requests.get(LASTUPDATE_URL, timeout=30)
         response.raise_for_status()
@@ -69,10 +77,7 @@ def get_lastupdate_timestamp():
     return None      
 
 
-        
-def get_starting_timestamp(last): 
-    """Gets timestamp of the last pulled file. If it is the first run, it identifies the starting file. """
-    
+def get_starting_timestamp(last):     
     if last:
         print(f"Starting file for extraction: {last}")
         return last        # if there is an existing stopping point from last pull, use that 
@@ -83,10 +88,7 @@ def get_starting_timestamp(last):
     return start
 
 
-
 def identify_files_to_pull(last, latest):
-    """Identifies all the files that must be pulled within given timeframe"""
-
     # if get_latestupdate_timestamp() has an error
     if latest is None:
         print("No latest timestamp available; skipping this run.")
@@ -115,8 +117,8 @@ def identify_files_to_pull(last, latest):
         timestamp = url.rsplit("/", 1)[-1].split(".")[0]    # extracts timestamp of the event uplad
         if start < timestamp <= latest:     # identifies files within give timefra,e
             files.append((timestamp, url, file_id))
-        if (len(files) % 50 == 0):
-            print(f"{len(files)} found...")
+            if len(files) % 50 == 0:
+                print(f"{len(files)} files found...")
 
     # return files in order
     files.sort()
@@ -126,10 +128,7 @@ def identify_files_to_pull(last, latest):
     return files
 
 
-
 def download_file(url, file_id):
-    """Downloads individual zip files from GDELT website."""
-
     # request and exceptiion
     try: 
         response = requests.get(url, timeout=60)
@@ -151,7 +150,6 @@ def download_file(url, file_id):
 
 
 def read_in_events(data,timestamp):
-    """Makes a pandas table from the files downloaded"""
     try: 
         with zipfile.ZipFile(io.BytesIO(data)) as zip_file:
             with zip_file.open(zip_file.namelist()[0]) as csv_file:
@@ -178,7 +176,6 @@ def read_in_events(data,timestamp):
 #! PROTECTING AGAISNT DUPLICATES -------------------------------------------------------
 
 def load_checkpoint():
-    """Gets last checkpoint, returns None for first run."""
     # reads state file
     if not os.path.exists(STATE_FILE):
         return None
@@ -187,7 +184,6 @@ def load_checkpoint():
 
 
 def save_checkpoint(last_timestamp):
-    """Updates save info."""
     # last timestamn and size to compare
     state = {
         "last_timestamp": last_timestamp,
@@ -200,7 +196,6 @@ def save_checkpoint(last_timestamp):
 
 
 def checkpoint_cleaning(state):
-    """Cuts off anything appended after the last checkpoint saved."""
     if state is None or not os.path.exists(RAW_FILE):
         return
     size = os.path.getsize(RAW_FILE)
@@ -215,8 +210,6 @@ def checkpoint_cleaning(state):
 
 
 def extract(last = None):
-
-    """Creates/appends to dataframe and CSV file."""
     # resume from checkpoint, undo any unconfirmed partial append
     state = load_checkpoint()
     checkpoint_cleaning(state)
@@ -234,16 +227,18 @@ def extract(last = None):
     # download each file and check that id matches
     for file, (timestamp, url, file_id) in enumerate(files, start = 1):
         data = download_file(url, file_id)
-        if data is None:
+        if data is None:                        # request fails
             print(f"Ending at {timestamp}.")    # next run will resume from here
             break
         # unzip into table
         events = read_in_events(data, timestamp)
-        if events is None:
+        if events is None:                      # issue unziping OR reading in as a table
             print(f"Ending at {timestamp}.")    # next run will resume from here
             break
         # add data to table
         tables.append(events)
+        if len(events) % 50 == 0:
+            print(f"{len(events)} files read in...")
         last_loaded = timestamp      
 
     # nothing was read; indicates a failure
@@ -261,7 +256,7 @@ def extract(last = None):
     events_df.to_csv(RAW_FILE, mode="a", header=write_header, index=False)
 
     # confirm the append: checkpoint AFTER data is written
-    save_state(last_loaded)
+    save_checkpoint(last_loaded)
 
     # summary output
     print(f"Received from GDELT: {len(events_df):,} rows from {len(tables)} files "
@@ -272,7 +267,5 @@ def extract(last = None):
 
 #! TEST ----------------------------------------------------------------
 
-if __name__ == "__main__":
-    events_df = extract()
-    print(events_df.shape)
-    print(events_df[["GLOBALEVENTID", "SQLDATE", "Actor1Name", "EventCode", "DATEADDED"]].head())
+# articles from the beginning of yesterday (LOOKBACK_DAYS = 1)
+events_df = extract()
