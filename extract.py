@@ -7,16 +7,18 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+import json 
 
 # using env folder
 load_dotenv()
 
 # local variables
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "3"))
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "1"))
 LASTUPDATE_URL = "https://data.gdeltproject.org/gdeltv2/lastupdate.txt"      # always updates with the last updated files
 MASTER_LIST_URL = "https://data.gdeltproject.org/gdeltv2/masterfilelist.txt" # every file
 RAW_DIR = "data" 
 RAW_FILE = os.path.join(RAW_DIR, "gdelt_events_raw.csv")
+STATE_FILE = os.path.join(RAW_DIR, "extract_state.json")
 EVENT_COLUMNS = [
     "GLOBALEVENTID", "SQLDATE", "MonthYear", "Year", "FractionDate",
     "Actor1Code", "Actor1Name", "Actor1CountryCode", "Actor1KnownGroupCode",
@@ -113,6 +115,8 @@ def identify_files_to_pull(last, latest):
         timestamp = url.rsplit("/", 1)[-1].split(".")[0]    # extracts timestamp of the event uplad
         if start < timestamp <= latest:     # identifies files within give timefra,e
             files.append((timestamp, url, file_id))
+        if (len(files) % 50 == 0):
+            print(f"{len(files)} found...")
 
     # return files in order
     files.sort()
@@ -171,6 +175,41 @@ def read_in_events(data,timestamp):
         print(f"Read {len(events):,} rows and {len(events.columns)} columns")
     return events
 
+#! PROTECTING AGAISNT DUPLICATES -------------------------------------------------------
+
+def load_checkpoint():
+    """Gets last checkpoint, returns None for first run."""
+    # reads state file
+    if not os.path.exists(STATE_FILE):
+        return None
+    with open(STATE_FILE) as f:
+        return json.load(f)
+
+
+def save_checkpoint(last_timestamp):
+    """Updates save info."""
+    # last timestamn and size to compare
+    state = {
+        "last_timestamp": last_timestamp,
+        "raw_bytes": os.path.getsize(RAW_FILE),
+    }
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_FILE) 
+
+
+def checkpoint_cleaning(state):
+    """Cuts off anything appended after the last checkpoint saved."""
+    if state is None or not os.path.exists(RAW_FILE):
+        return
+    size = os.path.getsize(RAW_FILE)
+    if size > state["raw_bytes"]:
+        print(f"Rolling back {size - state['raw_bytes']:,} unconfirmed bytes")
+        with open(RAW_FILE, "r+b") as f:
+            f.truncate(state["raw_bytes"])
+
+
 
 #! CREATING DF AND CSV -------------------------------------------------------
 
@@ -178,7 +217,11 @@ def read_in_events(data,timestamp):
 def extract(last = None):
 
     """Creates/appends to dataframe and CSV file."""
-    # finding appropriate files to extract
+    # resume from checkpoint, undo any unconfirmed partial append
+    state = load_checkpoint()
+    checkpoint_cleaning(state)
+    last = state["last_timestamp"] if state else None
+
     latest = get_lastupdate_timestamp()
     files = identify_files_to_pull(last, latest)
 
@@ -209,11 +252,16 @@ def extract(last = None):
     
     # combine all tables into one df
     events_df = pd.concat(tables, ignore_index=True)
+    # drop duplicates
+    events_df = events_df.drop_duplicates(subset="GLOBALEVENTID")
 
-    # create or append to csv file
+    # append to csv (header only if the file is new or empty)
     os.makedirs(RAW_DIR, exist_ok=True)
-    write_header = not os.path.exists(RAW_FILE)
+    write_header = not os.path.exists(RAW_FILE) or os.path.getsize(RAW_FILE) == 0
     events_df.to_csv(RAW_FILE, mode="a", header=write_header, index=False)
+
+    # confirm the append: checkpoint AFTER data is written
+    save_state(last_loaded)
 
     # summary output
     print(f"Received from GDELT: {len(events_df):,} rows from {len(tables)} files "
@@ -223,8 +271,8 @@ def extract(last = None):
 
 
 #! TEST ----------------------------------------------------------------
-events_df = extract(None)       # None = first run, look back LOOKBACK_DAYS
-print(events_df.shape)
-print(events_df[["GLOBALEVENTID", "SQLDATE", "Actor1Name", "EventCode", "DATEADDED"]].head())
 
-events_df.head()
+if __name__ == "__main__":
+    events_df = extract()
+    print(events_df.shape)
+    print(events_df[["GLOBALEVENTID", "SQLDATE", "Actor1Name", "EventCode", "DATEADDED"]].head())
