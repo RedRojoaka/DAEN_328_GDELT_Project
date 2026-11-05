@@ -1,6 +1,7 @@
 .venv
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .env
 .vscode/
 .idea/
@@ -9,4 +10,20 @@ bigquery-key.json
 *-service-account*.json
 *.db
 
+# local configuration, generated data, and test artifacts
+.env.*
+!.env.sample
 data/
+output/
+tmp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.log
+*.pem
+*.key

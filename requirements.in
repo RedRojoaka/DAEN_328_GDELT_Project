@@ -1,0 +1,12 @@
+# Direct dependencies. Regenerate requirements.txt using docs/DOCKER.md.
+# Keep NumPy 1.x / pandas 2.x while the team establishes its data API.
+numpy>=1.26,<2
+pandas>=2.2,<3
+requests>=2.32,<3
+python-dotenv>=1,<2
+SQLAlchemy>=2,<3
+psycopg2-binary>=2.9,<3
+streamlit>=1.40,<2
+plotly>=5,<7
+matplotlib>=3.9,<4
+pytest>=8,<9
