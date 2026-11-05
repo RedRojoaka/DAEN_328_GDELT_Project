@@ -1,0 +1,39 @@
+name: Docker infrastructure
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create ephemeral CI configuration
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import secrets
+          sample = Path('.env.sample').read_text()
+          Path('.env').write_text(sample.replace('POSTGRES_PASSWORD=\n', 'POSTGRES_PASSWORD=' + secrets.token_hex(24) + '\n'))
+          PY
+      - name: Validate and build
+        run: |
+          docker compose config --quiet
+          docker compose build etl dashboard
+      - name: Verify runtime and database
+        run: docker compose run --rm etl python scripts/docker_smoke.py
+      - name: Run application tests when present
+        shell: bash
+        run: |
+          if [ -d tests ]; then
+            docker compose run --rm etl pytest
+          else
+            echo '::notice::No application tests yet; only Docker infrastructure was verified.'
+          fi
+      - name: Clean up disposable CI database
+        if: always()
+        run: docker compose down -v --remove-orphans
