@@ -8,3 +8,5 @@ __pycache__/
 bigquery-key.json
 *-service-account*.json
 *.db
+
+data/
