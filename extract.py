@@ -1,11 +1,13 @@
 # libraries
 import os
 import io
+import time
 import hashlib
 import zipfile
 import requests
 import pandas as pd
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor 
 from dotenv import load_dotenv
 from dataclasses import dataclass, field
 
@@ -14,14 +16,18 @@ load_dotenv()
 
 
 # variables
-LOOKBACK_DAYS = 3
-LASTUPDATE_URL = "https://data.gdeltproject.org/gdeltv2/lastupdate.txt"      # always updates with the last updated files
-MASTER_LIST_URL = "https://data.gdeltproject.org/gdeltv2/masterfilelist.txt" # every file
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "2"))   
+INCLUDE_MENTIONS = os.getenv("INCLUDE_MENTIONS", "false").lower() == "true"   
+DOWNLOAD_WORKERS = 8       
+CHUNK_SIZE = 32            
+MAX_RETRIES = 3           
+LASTUPDATE_URL = "https://data.gdeltproject.org/gdeltv2/lastupdate.txt"     
+MASTER_LIST_URL = "https://data.gdeltproject.org/gdeltv2/masterfilelist.txt" 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_DIR = os.path.join(PROJECT_DIR, "data")
 BATCH_DIR = os.path.join(RAW_DIR, "batches")
 REJECT_DIR = os.path.join(RAW_DIR, "rejected")
-RAW_FILE = os.path.join(RAW_DIR, "gdelt_events_raw.csv")
+# event schema
 EVENT_COLUMNS = [
     "GLOBALEVENTID", "SQLDATE", "MonthYear", "Year", "FractionDate",
     "Actor1Code", "Actor1Name", "Actor1CountryCode", "Actor1KnownGroupCode",
@@ -43,7 +49,20 @@ EVENT_COLUMNS = [
     "ActionGeo_Long", "ActionGeo_FeatureID",
     "DATEADDED", "SOURCEURL",
 ]
-EXPECTED_FIELDS = len(EVENT_COLUMNS)
+# mentions schema 
+MENTION_COLUMNS = [
+    "GLOBALEVENTID", "EventTimeDate", "MentionTimeDate", "MentionType",
+    "MentionSourceName", "MentionIdentifier", "SentenceID",
+    "Actor1CharOffset", "Actor2CharOffset", "ActionCharOffset", "InRawText",
+    "Confidence", "MentionDocLen", "MentionDocTone",
+    "MentionDocTranslationInfo", "Extras",
+]
+# one entry per stream, replaces the global EXPECTED_FIELDS
+STREAMS = {
+    "events": EVENT_COLUMNS,
+    "mentions": MENTION_COLUMNS,
+}
+
 
 
 #! FAILURES -------------------------------------------------------------------
@@ -54,10 +73,34 @@ class ExtractionError(Exception):
 
 @dataclass
 class ExtractResult:
-    status: str         
+    status: str
     saved: list = field(default_factory=list)
+    skipped: list = field(default_factory=list) 
     stopped_at: str | None = None
 
+#! PATHS PER STREAM -------------------------------------------------------
+
+def batch_dir(stream):
+    return BATCH_DIR if stream == "events" else os.path.join(BATCH_DIR, stream)
+ 
+def skipped_path(stream):
+    return os.path.join(RAW_DIR, f"skipped_{stream}.txt")
+ 
+ 
+def skipped_timestamps(stream):
+    path = skipped_path(stream)
+    if not os.path.exists(path):
+        return set()
+    with open(path) as f:
+        return {line.split(",")[0] for line in f if line.strip()}
+ 
+ 
+def mark_skipped(stream, timestamp, reason):
+    os.makedirs(RAW_DIR, exist_ok=True)
+    with open(skipped_path(stream), "a") as f:
+        f.write(f"{timestamp},{reason}\n")
+    print(f"Skipping {stream} {timestamp} for good: {reason}")
+ 
 
 #! EXTRACTION FUNCTIONS -------------------------------------------------------
 
@@ -91,85 +134,104 @@ def get_starting_timestamp(last, saved_on_disk):
     print(f"Starting file for extraction: {start}")
     return start
 
-def identify_files_to_pull(last, latest, saved_on_disk):
-    # identifying extract timeframe
-    start = get_starting_timestamp(last, saved_on_disk)
-    print(f"Current extract getting files from {start} to {latest}")
 
-    # request and exception
+def get_master_list():
     try:
-        response = requests.get(MASTER_LIST_URL, timeout = 300)
+        response = requests.get(MASTER_LIST_URL, timeout=300, stream=True)
         response.raise_for_status()
+        lines = [line for line in response.iter_lines(decode_unicode=True) if line]
     except requests.exceptions.RequestException as exception:
         raise ExtractionError(f"Could not access {MASTER_LIST_URL}: {exception}") from exception
-    
+    return lines
+
+
+def identify_files_to_pull(stream, master_lines, last, latest, saved_on_disk):
+    # identifying extract timeframe
+    start = get_starting_timestamp(last, saved_on_disk)
+    print(f"Current {stream} extract getting files from {start} to {latest}")
+ 
     # finding files
     already_saved = set(saved_on_disk)
+    already_skipped = skipped_timestamps(stream)  
+    marker = ".export." if stream == "events" else f".{stream}."  
     files = []
-    for line in response.text.splitlines():
+    for line in master_lines:
         parts = line.split()
         if len(parts) != 3: continue        # skip if line has too many/too little parts
         file_size, file_id, url = parts
-        if ".export." not in url: continue   # grabs only files with event data
+        if marker not in url: continue      # grabs only files for this stream
         timestamp = url.rsplit("/", 1)[-1].split(".")[0]    # extracts timestamp of the event uplad
-        if start < timestamp <= latest and timestamp not in already_saved:            
+        if (start < timestamp <= latest
+                and timestamp not in already_saved
+                and timestamp not in already_skipped):    
             files.append((timestamp, url, file_id))
-            if len(files) % 50 == 0:
+            if len(files) % 100 == 0:                    
                 print(f"{len(files)} files found...")
-
+ 
     # return files in order
     files.sort()
-    if files: 
-        print(f"There are {len(files)} files to be extracted")
-
+    if files:
+        print(f"There are {len(files)} {stream} files to be extracted")
+ 
     return files
-
+ 
 
 def download_file(url, file_id):
-    # request and exceptiion
-    try: 
-        response = requests.get(url, timeout=60)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as exception: 
-        # if timeout exceeded or error occurs
-        print(f"Exception raised for {url}: {exception}")
-        return None
-    
-    # checking that file id's match 
-    if hashlib.md5(response.content).hexdigest() != file_id:
-        print(f"Checksum mismatch, will retry next run: {url}")
-        return None
-    
-    return response.content
+    reason = "unknown"
+    for attempt in range(1, MAX_RETRIES + 1):
+        # request and exceptiion
+        try:
+            response = requests.get(url, timeout=60)
+            if response.status_code == 404:
+                return "skip", "404 not found"
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exception:
+            # if timeout exceeded or error occurs
+            reason = f"request failed: {exception}"
+        else:
+            # checking that file id's match
+            if hashlib.md5(response.content).hexdigest() == file_id:
+                return "ok", response.content
+            reason = "checksum mismatch"
+ 
+        if attempt < MAX_RETRIES:
+            time.sleep(2 ** attempt)    # wait 2s, then 4s
+ 
+    print(f"Gave up on {url} after {MAX_RETRIES} tries: {reason}")
+    if reason == "checksum mismatch":
+        return "skip", reason
+    return "stop", reason
 
 
 #! REJECTED RECORDS ROWS ----------------------------------------------------------
 
-def split_valid_records(text):
+def split_valid_records(text, expected_fields):     
     # identifying invalid records
     valid, rejected = [], []
-    for line in text.split("\n"):  
+    for line in text.split("\n"):
         line = line.rstrip("\r")
         if not line:
             continue
-        if line.count("\t") == EXPECTED_FIELDS - 1:
+        if line.count("\t") == expected_fields - 1:
             valid.append(line)
         else:
             rejected.append(line)
     return valid, rejected
-
-
-def save_rejected(rejected, timestamp):
+ 
+ 
+def save_rejected(rejected, timestamp, stream):   
     # make rejects csv
     os.makedirs(REJECT_DIR, exist_ok=True)
-    path = os.path.join(REJECT_DIR, f"{timestamp}.csv")
+    path = os.path.join(REJECT_DIR, f"{stream}_{timestamp}.csv")
     pd.DataFrame({"raw_record": rejected}).to_csv(path, index=False)
     print(f"Quarantined {len(rejected)} malformed rows: {path}")
 
 
 #! TABLE BUILDING FUNCTIONS -------------------------------------------------------
 
-def read_in_events(data, timestamp):
+def read_in_file(data, timestamp, stream):
+    columns = STREAMS[stream]
+ 
     # unzips each update file from gdelt site
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zip_file:
@@ -177,163 +239,157 @@ def read_in_events(data, timestamp):
     except (zipfile.BadZipFile, IndexError) as exception:
         print(f"Could not read file {timestamp}: {exception}")
         return None
-    
+ 
     # bytes to text
     text = raw_bytes.decode("utf-8", errors="replace")
-
+ 
     # separate valid and invalid rows
-    valid, rejected = split_valid_records(text)
+    valid, rejected = split_valid_records(text, len(columns))
     if rejected:
-        save_rejected(rejected, timestamp)
-    if rejected and not valid:          # nothing usable: stop instead of skipping it
+        save_rejected(rejected, timestamp, stream)
+    if rejected and not valid:          # nothing usable
         print(f"Every row in {timestamp} was malformed.")
         return None
     if not valid:                       # a genuinely empty archive
-        return pd.DataFrame(columns=EVENT_COLUMNS, dtype=str)
-    
-    # creating the events df
-    events = pd.read_csv(
+        return pd.DataFrame(columns=columns, dtype=str)
+ 
+    # creating the df
+    df = pd.read_csv(
         io.StringIO("\n".join(valid)),
         sep="\t",
         header=None,
-        names=EVENT_COLUMNS,
+        names=columns,
         dtype=str,
         quoting=3,
         keep_default_na=False,
         lineterminator="\n",
     )
-
-    return events
+ 
+    return df
 
 
 #! SAVING / READING BATCHES -------------------------------------------------------
 
-def save_batch(events, timestamp):
+def save_batch(df, timestamp, stream): 
     # saves all records from individual zip file
-    os.makedirs(BATCH_DIR, exist_ok=True)
-    final_path = os.path.join(BATCH_DIR, f"{timestamp}.csv")
-
+    folder = batch_dir(stream)
+    os.makedirs(folder, exist_ok=True)
+    final_path = os.path.join(folder, f"{timestamp}.csv")
+ 
     # creates temp file
     tmp_path = final_path + ".tmp"
-    events.to_csv(tmp_path, index=False)
-
+    df.to_csv(tmp_path, index=False)
+ 
     # rename once the write is complete
     os.replace(tmp_path, final_path)
 
 
-def saved_timestamps():
+def saved_timestamps(stream="events"):
     # gets timestamps from saved batch filenames
-    if not os.path.isdir(BATCH_DIR):
+    folder = batch_dir(stream)
+    if not os.path.isdir(folder):
         return []
     return sorted(
         name.removesuffix(".csv")
-        for name in os.listdir(BATCH_DIR)
+        for name in os.listdir(folder)
         if name.endswith(".csv")
     )
 
-def read_batch(timestamp):
-    path = os.path.join(BATCH_DIR, f"{timestamp}.csv")
+
+def read_batch(timestamp, stream="events"):
+    path = os.path.join(batch_dir(stream), f"{timestamp}.csv")
     return pd.read_csv(path, dtype=str, keep_default_na=False)
 
-def append_to_raw(events):
-    # multiple runs add to the raw file
-    os.makedirs(RAW_DIR, exist_ok=True)
-    write_header = not os.path.exists(RAW_FILE) or os.path.getsize(RAW_FILE) == 0
-    events.to_csv(RAW_FILE, mode="a", header=write_header, index=False)
 
-
-#! HANDLING CRASHES -------------------------------------------------------
-
-def repair_raw_file():
-    # removes a half-written last row left by a crash
-    if not os.path.exists(RAW_FILE):
-        return
-
-    size = os.path.getsize(RAW_FILE)
-
-    # only the end of the file needs checking
-    start = max(0, size - 1_048_576)    
-    with open(RAW_FILE, "r+b") as f:
-        f.seek(start)
-        last_newline = f.read().rfind(b"\n")
-        f.truncate(start + last_newline + 1)
-
-def verify_raw_file(timestamps):
-    # the raw file must hold at least every finished batch
-    paths = [os.path.join(BATCH_DIR, f"{timestamp}.csv") for timestamp in timestamps]
-    with open(paths[0], "rb") as f:
-        header_bytes = len(f.readline())
-
-    expected = sum(os.path.getsize(path) - header_bytes for path in paths) + header_bytes
-    if os.path.getsize(RAW_FILE) < expected:
-        raise ExtractionError(
-            f"{RAW_FILE} is smaller than its saved batches. "
-            f"Delete {BATCH_DIR} and {RAW_FILE}, then run again to rebuild them."
-        )
+def iter_batches(stream="events", after=None):
+    # one 15-min file at a time
+    for timestamp in saved_timestamps(stream):
+        if after is None or timestamp > after:
+            yield timestamp, read_batch(timestamp, stream)
 
 
 #! CREATING DF AND CSV -------------------------------------------------------
 
-
-def extract(last=None):
+def extract(stream="events", last=None, master_lines=None, latest=None):
     # finding where to start/resume extracting
-    # last overrides LOOKBACK_DAYS as the start of the window 
-    saved_on_disk = saved_timestamps()
-    if saved_on_disk and not os.path.exists(RAW_FILE):
-        raise ExtractionError(
-            f"{RAW_FILE} is missing but batches exist. "
-            f"Delete {BATCH_DIR} and run again to rebuild it."
-        )
-
-    # fixes crash mid-extraction
-    repair_raw_file()
-    if saved_on_disk:
-        verify_raw_file(saved_on_disk)
-
-
+    # last overrides LOOKBACK_DAYS as the start of the window
+    saved_on_disk = saved_timestamps(stream)
+    # CHANGE #1: raw-file checks removed here
+ 
     # find the files to download
-    latest = get_lastupdate_timestamp()
-    files = identify_files_to_pull(last, latest, saved_on_disk)
+    latest = latest or get_lastupdate_timestamp()
+    master_lines = master_lines or get_master_list()
+    files = identify_files_to_pull(stream, master_lines, last, latest, saved_on_disk)
     if not files:
-        print("No new files to extract.")
+        print(f"No new {stream} files to extract.")
         return ExtractResult("no_new_files")
-
-    # tracking what this run saved and where it stopped
-    saved, stopped_at = [], None
-
-    # downloading files
-    for file, (timestamp, url, file_id) in enumerate(files, start=1):
-        data = download_file(url, file_id)
-        events = None if data is None else read_in_events(data, timestamp)
-        if events is None:              # stop so a later run can't leave a gap
-            print(f"Ending at {timestamp}.")
-            stopped_at = timestamp
-            break
-
-        # dropping duplicated based on globalid
-        events = events.drop_duplicates(subset="GLOBALEVENTID")
-        append_to_raw(events)           # rows first
-        save_batch(events, timestamp)   # marks this archive as finished
-        saved.append(timestamp)
-        if file % 50 == 0:
-            print(f"{file} files saved...")
-
+ 
+    # tracking what this run saved, skipped, and where it stopped
+    saved, skipped, stopped_at = [], [], None
+    done = 0
+ 
+    # download a chunk in parallel, then save that chunk in order
+    with ThreadPoolExecutor(DOWNLOAD_WORKERS) as pool:
+        for i in range(0, len(files), CHUNK_SIZE):
+            chunk = files[i:i + CHUNK_SIZE]
+            results = pool.map(lambda f: download_file(f[1], f[2]), chunk)
+ 
+            for (timestamp, url, file_id), (status, payload) in zip(chunk, results):
+                # CHANGE #3: network trouble -> stop so a later run can't leave a gap
+                if status == "stop":
+                    print(f"Ending at {timestamp}.")
+                    stopped_at = timestamp
+                    break
+ 
+                # CHANGE #3: the file itself is bad -> log it and keep going
+                if status == "skip":
+                    mark_skipped(stream, timestamp, payload)
+                    skipped.append(timestamp)
+                    continue
+ 
+                df = read_in_file(payload, timestamp, stream)
+                if df is None:      # CHANGE #3: unreadable zip / all rows bad is permanent, skip it
+                    mark_skipped(stream, timestamp, "unreadable or all rows malformed")
+                    skipped.append(timestamp)
+                    continue
+ 
+                # dropping duplicated based on globalid
+                if stream == "events":
+                    df = df.drop_duplicates(subset="GLOBALEVENTID")
+                save_batch(df, timestamp, stream)   # marks this archive as finished
+                saved.append(timestamp)
+ 
+                done += 1
+                if done % 100 == 0:             
+                    print(f"{done} {stream} files saved...")
+ 
+            if stopped_at:
+                break
+ 
     # report
     if stopped_at is None:
-        return ExtractResult("success", saved)
+        return ExtractResult("success", saved, skipped)
     if saved:
-        return ExtractResult("partial", saved, stopped_at)
-    raise ExtractionError(f"No archives saved; stopped at {stopped_at}")
+        return ExtractResult("partial", saved, skipped, stopped_at)
+    raise ExtractionError(f"No {stream} archives saved; stopped at {stopped_at}")
+ 
 
 
 #! RUN EXTRACTION ----------------------------------------------------------------
 
 if __name__ == "__main__":
+    # CHANGE #6: runs events, plus mentions if INCLUDE_MENTIONS=true
+    streams = ["events"] + (["mentions"] if INCLUDE_MENTIONS else [])
     try:
-        result = extract()
+        latest = get_lastupdate_timestamp()
+        master_lines = get_master_list()        # downloaded once, used by both
+        results = {s: extract(s, master_lines=master_lines, latest=latest) for s in streams}
     except ExtractionError as exception:
         raise SystemExit(f"Extraction failed: {exception}")
-
-    print(f"Extract finished: {result.status}, {len(result.saved)} files saved")
-    if result.status == "partial":
-        raise SystemExit(f"Extraction stopped early at {result.stopped_at}")
+ 
+    for stream, result in results.items():
+        print(f"{stream} extract finished: {result.status}, "
+              f"{len(result.saved)} files saved, {len(result.skipped)} skipped")
+    partial = [s for s, r in results.items() if r.status == "partial"]
+    if partial:
+        raise SystemExit(f"Extraction stopped early for: {', '.join(partial)}")
