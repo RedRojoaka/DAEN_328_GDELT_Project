@@ -1,13 +1,14 @@
-"""Clean the GDELT Events CSV produced by extract.py, without downloading data.
+"""Clean extracted GDELT batches without downloading data.
 
-Run ``python transform.py`` after extraction, or pass an extracted DataFrame to
-``transform(events_df)``. See README.md for table keys and analysis limitations.
+Run ``python transform.py`` for daily CSV exports, or pass a DataFrame to
+``transform(events_df)``. Use ``iter_transformed_days`` for daily loading.
 """
 
 import argparse
 import hashlib
 import json
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -15,10 +16,10 @@ import pandas as pd
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-RAW_FILE = PROJECT_DIR / "data" / "gdelt_events_raw.csv"
+BATCH_DIR = PROJECT_DIR / "data" / "batches"
 OUTPUT_DIR = PROJECT_DIR / "data" / "transformed"
 
-# Do not import extract.py: its module-level extract() call performs network I/O.
+# Optional actor and location fields remain NULL when absent.
 ACTOR_FIELDS = [
     "Code", "Name", "CountryCode", "KnownGroupCode", "EthnicCode",
     "Religion1Code", "Religion2Code", "Type1Code", "Type2Code", "Type3Code",
@@ -58,11 +59,51 @@ RIGHTS_EVENT_CODES = {
 }
 
 
+# GeoNames countryInfo.txt (2026-11-11), FIPS and ISO3 columns:
+# https://download.geonames.org/export/dump/countryInfo.txt (CC BY 4.0).
+# GDELT's separate Gaza/West Bank codes both join to PSE. Unmapped codes
+# (including historical entities and Kosovo without an official ISO3) stay NULL.
+FIPS_TO_ISO3 = dict(pair.split(":") for pair in """
+    AA:ABW AC:ATG AE:ARE AF:AFG AG:DZA AJ:AZE AL:ALB AM:ARM AN:AND AO:AGO
+    AQ:ASM AR:ARG AS:AUS AU:AUT AV:AIA AY:ATA BA:BHR BB:BRB BC:BWA BD:BMU
+    BE:BEL BF:BHS BG:BGD BH:BLZ BK:BIH BL:BOL BM:MMR BN:BEN BO:BLR BP:SLB
+    BR:BRA BT:BTN BU:BGR BV:BVT BX:BRN BY:BDI CA:CAN CB:KHM CD:TCD CE:LKA
+    CF:COG CG:COD CH:CHN CI:CHL CJ:CYM CK:CCK CM:CMR CN:COM CO:COL CQ:MNP
+    CS:CRI CT:CAF CU:CUB CV:CPV CW:COK CY:CYP DA:DNK DJ:DJI DO:DMA DR:DOM
+    EC:ECU EG:EGY EI:IRL EK:GNQ EN:EST ER:ERI ES:SLV ET:ETH EZ:CZE FG:GUF
+    FI:FIN FJ:FJI FK:FLK FM:FSM FO:FRO FP:PYF FR:FRA FS:ATF GA:GMB GB:GAB
+    GG:GEO GH:GHA GI:GIB GJ:GRD GK:GGY GL:GRL GM:DEU GP:GLP GQ:GUM GR:GRC
+    GT:GTM GV:GIN GY:GUY GZ:PSE HA:HTI HK:HKG HM:HMD HO:HND HR:HRV HU:HUN
+    IC:ISL ID:IDN IM:IMN IN:IND IO:IOT IR:IRN IS:ISR IT:ITA IV:CIV IZ:IRQ
+    JA:JPN JE:JEY JM:JAM JO:JOR KE:KEN KG:KGZ KN:PRK KR:KIR KS:KOR KT:CXR
+    KU:KWT KZ:KAZ LA:LAO LE:LBN LG:LVA LH:LTU LI:LBR LO:SVK LS:LIE LT:LSO
+    LU:LUX LY:LBY MA:MDG MB:MTQ MC:MAC MD:MDA MF:MYT MG:MNG MH:MSR MI:MWI
+    MJ:MNE MK:MKD ML:MLI MN:MCO MO:MAR MP:MUS MR:MRT MT:MLT MU:OMN MV:MDV
+    MX:MEX MY:MYS MZ:MOZ NC:NCL NE:NIU NF:NFK NG:NER NH:VUT NI:NGA NL:NLD
+    NN:SXM NO:NOR NP:NPL NR:NRU NS:SUR NU:NIC NZ:NZL OD:SSD PA:PRY PC:PCN
+    PE:PER PK:PAK PL:POL PM:PAN PO:PRT PP:PNG PS:PLW PU:GNB QA:QAT RE:REU
+    RI:SRB RM:MHL RN:MAF RO:ROU RP:PHL RQ:PRI RS:RUS RW:RWA SA:SAU SB:SPM
+    SC:KNA SE:SYC SF:ZAF SG:SEN SH:SHN SI:SVN SL:SLE SM:SMR SN:SGP SO:SOM
+    SP:ESP ST:LCA SU:SDN SV:SJM SW:SWE SX:SGS SY:SYR SZ:CHE TB:BLM TD:TTO
+    TH:THA TI:TJK TK:TCA TL:TKL TN:TON TO:TGO TP:STP TS:TUN TT:TLS TU:TUR
+    TV:TUV TW:TWN TX:TKM TZ:TZA UC:CUW UG:UGA UK:GBR UP:UKR US:USA UV:BFA
+    UY:URY UZ:UZB VC:VCT VE:VEN VI:VGB VM:VNM VQ:VIR VT:VAT WA:NAM WE:PSE
+    WF:WLF WI:ESH WS:WSM WZ:SWZ YM:YEM ZA:ZMB ZI:ZWE
+""".split())
+
+
 @dataclass
 class TransformResult:
     cleaned_events: pd.DataFrame
     tables: dict[str, pd.DataFrame]
     rejected_events: pd.DataFrame
+    quality_report: dict
+
+
+@dataclass
+class MentionTransformResult:
+    cleaned_mentions: pd.DataFrame
+    rejected_mentions: pd.DataFrame
     quality_report: dict
 
 
@@ -188,11 +229,32 @@ def _source_parts(value):
         return pd.NA, pd.NA
 
 
-def add_analysis_features(events):
+def add_analysis_features(events, *, start_date=None, end_date=None):
     """Add transparent filters for the proposal; flags do not establish causation."""
     cleaned = events.copy()
     cleaned["EventMonth"] = cleaned["SQLDATE"].dt.strftime("%Y-%m").astype("string")
     cleaned["ReportDate"] = cleaned["DATEADDED"].dt.floor("D")
+    cleaned["ReportMonth"] = cleaned["ReportDate"].dt.strftime("%Y-%m").astype("string")
+    # Keep actual event dates; a missing study window leaves the flag NULL.
+    bounds = []
+    for value in (start_date, end_date):
+        day = None if value is None else pd.Timestamp(value)
+        if day is not None:
+            if pd.isna(day) or day.tzinfo is not None or day != day.normalize():
+                raise ValueError("Study bounds must be valid timezone-free calendar dates")
+        bounds.append(day)
+    start, end = bounds
+    if start is not None and end is not None and start > end:
+        raise ValueError("start_date must not be after end_date")
+    has_window = start is not None or end is not None
+    in_window = pd.Series(True if has_window else pd.NA, index=cleaned.index, dtype="boolean")
+    if start is not None:
+        in_window &= cleaned["SQLDATE"].ge(start)
+    if end is not None:
+        in_window &= cleaned["SQLDATE"].le(end)
+    cleaned["IsInAnalysisWindow"] = in_window
+    # Map action-country codes for joins; unknown codes remain NULL.
+    cleaned["ActionGeo_CountryISO3"] = cleaned["ActionGeo_CountryCode"].map(FIPS_TO_ISO3).astype("string")
     cleaned["EventRootLabel"] = cleaned["EventRootCode"].map(ROOT_LABELS).astype("string")
     cleaned["QuadClassLabel"] = cleaned["QuadClass"].map(QUAD_LABELS).astype("string")
     cleaned["IsProtest"] = cleaned["EventRootCode"].eq("14").astype("boolean")
@@ -200,12 +262,17 @@ def add_analysis_features(events):
     cleaned["IsConcessionEvent"] = cleaned["EventRootCode"].eq("08").astype("boolean")
     cleaned["IsRightsRelatedEvent"] = cleaned["EventCode"].isin(RIGHTS_EVENT_CODES).astype("boolean")
     cleaned.loc[cleaned["EventCode"].isna(), "IsRightsRelatedEvent"] = pd.NA
+    # Exclude government-related types from the stricter HRI flag; keep raw HRI.
     religious = {}
     rights_actor = {}
     for actor in (1, 2):
         religious[actor] = cleaned[[f"Actor{actor}Religion{i}Code" for i in (1, 2)]].notna().any(axis=1)
-        rights_actor[actor] = cleaned[[f"Actor{actor}Type{i}Code" for i in (1, 2, 3)]].eq("HRI").any(axis=1)
-        cleaned[f"Actor{actor}IsHumanRightsCoded"] = rights_actor[actor]
+        types = cleaned[[f"Actor{actor}Type{i}Code" for i in (1, 2, 3)]]
+        hri = types.eq("HRI").any(axis=1)
+        government = types.isin(["GOV", "MIL", "COP", "JUD", "SPY"]).any(axis=1)
+        cleaned[f"Actor{actor}IsHumanRightsCoded"] = hri
+        rights_actor[actor] = hri & ~government
+        cleaned[f"Actor{actor}IsHumanRightsActor"] = rights_actor[actor]
         cleaned[f"Actor{actor}HumanRightsNameCandidate"] = cleaned[f"Actor{actor}Name"].str.contains(
             r"\b(?:AMNESTY INTERNATIONAL|HUMAN RIGHTS WATCH|HUMAN RIGHTS)\b", na=False, regex=True,
         )
@@ -213,6 +280,7 @@ def add_analysis_features(events):
     cleaned["ReligionHumanRightsCooccurrence"] = (
         (religious[1] & rights_actor[2]) | (religious[2] & rights_actor[1])
     )
+    # URL keywords identify candidates, not confirmed oil-crisis coverage.
     cleaned["IsIranLinked"] = (
         cleaned[["Actor1CountryCode", "Actor2CountryCode"]].eq("IRN").any(axis=1)
         | cleaned[[f"{prefix}_CountryCode" for prefix in GEO_PREFIXES]].eq("IR").any(axis=1)
@@ -223,6 +291,8 @@ def add_analysis_features(events):
     cleaned["OilURLCandidate"] = url_text.str.contains(
         r"(?i)(?:^|[^a-z0-9])(?:oil|petroleum|crude|hormuz)(?:$|[^a-z0-9])", regex=True,
     ).astype("boolean")
+    cleaned["HasOPCActor"] = cleaned[["Actor1KnownGroupCode", "Actor2KnownGroupCode"]].eq("OPC").any(axis=1)
+    cleaned["IranOil"] = cleaned["OilURLCandidate"] & cleaned["IsIranLinked"]
     return cleaned
 
 
@@ -285,14 +355,12 @@ def build_tables(events):
     }.items()}
 
 
-def transform(events=None):
-    """Transform a batch (or the full raw CSV); return tables and quality evidence.
+def transform(events, *, start_date=None, end_date=None):
+    """Transform one in-memory batch; return tables and quality evidence.
 
     Optional missing attributes remain NULL. Only unusable IDs/dates quarantine a
     row. No filtering by topic is applied, so denominators remain available.
     """
-    if events is None:
-        events = pd.read_csv(RAW_FILE, dtype="string", keep_default_na=False)
     missing_columns = REQUIRED_COLUMNS - set(events.columns)
     if missing_columns:
         raise ValueError(f"Missing required extract columns: {', '.join(sorted(missing_columns))}")
@@ -319,7 +387,7 @@ def transform(events=None):
     rejected_raw["RejectionReason"] = rejected["RejectionReason"]
     cleaned = remove_duplicates(valid)
     duplicates_removed = len(valid) - len(cleaned)
-    cleaned = add_analysis_features(cleaned)
+    cleaned = add_analysis_features(cleaned, start_date=start_date, end_date=end_date)
     tables = build_tables(cleaned)
     report = {
         "input_rows": len(raw), "cleaned_rows": len(cleaned),
@@ -338,38 +406,160 @@ def transform(events=None):
             }
             for column, cleaned_value in converted_columns.items()
         },
+        "outside_analysis_window": int((~cleaned["IsInAnalysisWindow"]).sum()),
+        "window_not_evaluated": int(cleaned["IsInAnalysisWindow"].isna().sum()),
+        "analysis_start": str(start_date) if start_date is not None else None,
+        "analysis_end": str(end_date) if end_date is not None else None,
+        "unmapped_action_country_codes": sorted(cleaned.loc[
+            cleaned["ActionGeo_CountryCode"].notna() & cleaned["ActionGeo_CountryISO3"].isna(),
+            "ActionGeo_CountryCode",
+        ].unique().tolist()),
         "table_rows": {name: len(frame) for name, frame in tables.items()},
     }
     print(f"Transform: {len(raw):,} input rows; {len(cleaned):,} after cleaning; "
           f"{duplicates_removed:,} duplicates removed; {len(rejected_raw):,} rows quarantined.")
-    for column, counts in report["missing_values"].items():
+    print_missing_summary(report["missing_values"])
+    return TransformResult(cleaned, tables, rejected_raw.reset_index(drop=True), report)
+
+
+def print_missing_summary(columns):
+    """Print per-column missing-value counts and handling policies."""
+    for column, counts in columns.items():
         print(f"  {column}: {counts['input_missing']} missing, "
               f"{counts['invalid_values_set_null']} invalid -> NULL, "
               f"{counts['values_filled_or_derived']} derived; {counts['policy']}")
-    return TransformResult(cleaned, tables, rejected_raw.reset_index(drop=True), report)
+
+
+# Select archives separately from the dates of the events they describe.
+
+
+def batch_paths(input_dir):
+    """Find only completed timestamp-named extraction files, in archive order."""
+    folder = Path(input_dir)
+    if not folder.is_dir():
+        raise ValueError(f"Batch directory does not exist: {folder}")
+    paths = sorted(path for path in folder.glob("*.csv")
+                   if len(path.stem) == 14 and path.stem.isascii() and path.stem.isdigit())
+    if not paths:
+        raise ValueError(f"No timestamped CSV batches in {folder}; run extract.py first")
+    return paths
+
+
+def iter_transformed_days(input_dir=BATCH_DIR, *, timestamps=None, start_date=None, end_date=None):
+    """Yield the last archive timestamp and cleaned tables for each day.
+
+    Pass ExtractResult.ready to select batches; an empty list produces no output.
+    Study dates flag events without changing the archive selection.
+    """
+    if timestamps is None:
+        paths = batch_paths(input_dir)
+    else:
+        stamps = sorted(set(timestamps))
+        for stamp in stamps:
+            if len(stamp) != 14 or not stamp.isascii() or not stamp.isdigit():
+                raise ValueError("Archive timestamps must be YYYYMMDDHHMMSS")
+        paths = [Path(input_dir) / f"{stamp}.csv" for stamp in stamps]
+    for day, files in groupby(paths, key=lambda path: path.stem[:8]):
+        files = list(files)
+        raw = pd.concat(
+            [pd.read_csv(path, dtype="string", keep_default_na=False) for path in files],
+            ignore_index=True,
+        )
+        result = transform(raw, start_date=start_date, end_date=end_date)
+        del raw
+        yield files[-1].stem, result
+        del result
+
+
+def transform_mentions(mentions, existing_event_ids):
+    """Clean mentions and keep only references to existing events.
+
+    Return cleaned rows, rejected rows, and quality counts. The loader assigns
+    MentionID and prevents duplicate inserts across runs.
+    """
+    required = {"GLOBALEVENTID", "EventTimeDate", "MentionTimeDate", "MentionIdentifier"}
+    missing = required - set(mentions.columns)
+    if missing:
+        raise ValueError(f"Missing required mention columns: {', '.join(sorted(missing))}")
+    raw = mentions.drop(columns="MentionID", errors="ignore").reset_index(drop=True).copy()
+    before = normalize_missing_values(raw)
+    cleaned = convert_numeric_values(before)
+    for column in ("EventTimeDate", "MentionTimeDate"):
+        values = cleaned[column].where(cleaned[column].str.fullmatch(r"\d{14}", na=False))
+        cleaned[column] = pd.to_datetime(values, format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+    for column, high in {
+        "MentionType": 3, "SentenceID": 2**31 - 1, "Actor1CharOffset": 2**31 - 1,
+        "Actor2CharOffset": 2**31 - 1, "ActionCharOffset": 2**31 - 1,
+        "InRawText": 1, "Confidence": 100, "MentionDocLen": 2**31 - 1,
+    }.items():
+        if column in cleaned:
+            values = pd.to_numeric(cleaned[column], errors="coerce")
+            low = 1 if column == "MentionType" else 0
+            cleaned[column] = values.where(values.between(low, high) & values.mod(1).eq(0)).astype("Int64")
+    if "MentionDocTone" in cleaned:
+        values = pd.to_numeric(cleaned["MentionDocTone"], errors="coerce")
+        cleaned["MentionDocTone"] = values.where(values.between(-100, 100)).astype("Float64")
+    known_ids = pd.Index(existing_event_ids).astype("int64")
+    orphan = ~cleaned["GLOBALEVENTID"].isin(known_ids)
+    invalid = cleaned[["EventTimeDate", "MentionTimeDate", "MentionIdentifier"]].isna().any(axis=1)
+    kept = cleaned.loc[~(orphan | invalid)].drop_duplicates().reset_index(drop=True)
+    rejected = raw.loc[orphan | invalid].copy()
+    rejected["RejectionReason"] = [
+        "; ".join(reason for reason, applies in (
+            ("invalid or unknown GLOBALEVENTID", orphan.loc[index]),
+            ("missing/invalid mention timestamp or identifier", invalid.loc[index]),
+        ) if applies) for index in rejected.index
+    ]
+    missing_values = {
+        column: {
+            "input_missing": int(before[column].isna().sum()),
+            "invalid_values_set_null": int((before[column].notna() & cleaned[column].isna()).sum()),
+            "values_filled_or_derived": 0,
+            "policy": "quarantine row" if column in required else "retain NULL",
+        } for column in before.columns
+    }
+    report = {
+        "input_rows": len(raw), "cleaned_rows": len(kept),
+        "rejected_rows": len(rejected),
+        "unknown_event_rows": int(orphan.sum()), "invalid_mention_rows": int(invalid.sum()),
+        "duplicates_removed": int((~(orphan | invalid)).sum()) - len(kept),
+        "missing_values": missing_values,
+    }
+    print(f"Mentions: {len(raw)} input; {len(kept)} cleaned; "
+          f"{len(rejected)} quarantined; {report['duplicates_removed']} duplicates removed.")
+    print_missing_summary(missing_values)
+    return MentionTransformResult(kept, rejected.reset_index(drop=True), report)
+
+
+# Export daily tables for inspection without combining the whole dataset.
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=RAW_FILE)
+    parser.add_argument("--input", type=Path, default=BATCH_DIR, help="Directory of timestamped event CSVs")
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--start-date", help="Inclusive SQLDATE analysis start (YYYY-MM-DD)")
+    parser.add_argument("--end-date", help="Inclusive SQLDATE analysis end (YYYY-MM-DD)")
     args = parser.parse_args()
-    if args.input.resolve() == args.output_dir.resolve() or args.input.resolve().parent == args.output_dir.resolve():
-        parser.error("Use a separate output directory to preserve the raw input.")
+    source, output = args.input.resolve(), args.output_dir.resolve()
+    if source == output or source in output.parents or output in source.parents:
+        parser.error("Use an output directory separate from the raw batch tree.")
     try:
-        raw = pd.read_csv(args.input, dtype="string", keep_default_na=False)
-        result = transform(raw)
+        for through, result in iter_transformed_days(
+            args.input, start_date=args.start_date, end_date=args.end_date,
+        ):
+            folder = args.output_dir / through[:8]
+            folder.mkdir(parents=True, exist_ok=True)
+            for name, frame in result.tables.items():
+                frame.to_csv(folder / f"{name}.csv", index=False)
+            result.rejected_events.to_csv(folder / "rejected_events.csv", index=False)
+            (folder / "quality_report.json").write_text(
+                json.dumps(result.quality_report, indent=2) + "\n", encoding="utf-8",
+            )
+            print(f"Wrote daily tables to {folder}")
+            del result
     except (OSError, ValueError, pd.errors.ParserError) as exception:
-        parser.exit(1, f"Transform failed: {exception}\nRun extract.py first or supply --input PATH.\n")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    for name, frame in result.tables.items():
-        frame.to_csv(args.output_dir / f"{name}.csv", index=False)
-    result.cleaned_events.to_csv(args.output_dir / "gdelt_events_clean.csv", index=False)
-    result.rejected_events.to_csv(args.output_dir / "rejected_events.csv", index=False)
-    (args.output_dir / "quality_report.json").write_text(
-        json.dumps(result.quality_report, indent=2) + "\n", encoding="utf-8",
-    )
-    print(f"Wrote transformed data to {args.output_dir}")
+        parser.exit(1, f"Transform failed: {exception}\n")
 
 
 if __name__ == "__main__":
