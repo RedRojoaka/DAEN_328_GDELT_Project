@@ -419,7 +419,7 @@ docker compose run --rm --no-deps \
 
 | Member | Contribution |
 | --- | --- |
-| Maya Brumbalow | Extraction implementation. |
+| Maya Brumbalow | Extraction implementation, building presentation, transformation changes, dashboard planning. |
 | Peyton Kocher | Daily GDELT processing, validation tests, Docker setup, infrastructure checks. |
 | Tony (Anastacio) Moreno | PostgreSQL loading, pgAdmin schema/ERD, and dashboard development. |
 | Alejandro Rojo | Transformation, repository integration/documentation, and dashboard development. |
