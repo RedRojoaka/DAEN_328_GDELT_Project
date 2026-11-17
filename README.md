@@ -152,15 +152,15 @@ references remain NULL. Dates use `DATE`, recording times `TIMESTAMPTZ`, counts
 `BIGINT`, measures `DOUBLE PRECISION`, flags `BOOLEAN`, and codes `TEXT`.
 Event indexes cover date, type, action location, and both actor references.
 
+
 ### Final ERD
+![PostgreSQL schema exported from pgAdmin](docs/erd.png)
 
-**Pending Tony's pgAdmin export:** save the final diagram as
-`docs/images/erd.png` and embed it here. Include the six tables above and their
-actual keys from `load.py`.
+Decision Context:
+The design is a **star schema**: `events` is the fact table, surrounded by the dimension tables
+`actors`, `locations` and `event_types`. `actor_religions` is a bridge table for the
+many-to-many relationship between actors and religions, and `etl_runs` is a standalone audit log.
 
-<!-- Enable after the real ERD is supplied:
-![PostgreSQL schema exported from pgAdmin](docs/images/erd.png)
--->
 
 ## Run the complete stack
 
