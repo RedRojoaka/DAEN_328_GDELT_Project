@@ -133,9 +133,7 @@ rules; country/location links also do not directly measure economic oil impacts.
 
 ## PostgreSQL schema and ERD
 
-`load.py` automatically creates the tables, primary/foreign keys, and indexes.
-Actor and location descriptors are separated from event facts, event taxonomy
-has its own table, and religion memberships use a bridge.
+### Schema Table:
 
 | Table | Primary key | Contents and relationships |
 | --- | --- | --- |
@@ -152,15 +150,32 @@ references remain NULL. Dates use `DATE`, recording times `TIMESTAMPTZ`, counts
 `BIGINT`, measures `DOUBLE PRECISION`, flags `BOOLEAN`, and codes `TEXT`.
 Event indexes cover date, type, action location, and both actor references.
 
+
 ### Final ERD
-
-**Pending Tony's pgAdmin export:** save the final diagram as
-`docs/images/erd.png` and embed it here. Include the six tables above and their
-actual keys from `load.py`.
-
-<!-- Enable after the real ERD is supplied:
 ![PostgreSQL schema exported from pgAdmin](docs/images/erd.png)
--->
+
+Decision Context:
+The design is a **star schema**: `events` is the fact table, surrounded by the dimension tables
+`actors`, `locations` and `event_types`. `actor_religions` is a bridge table for the
+many-to-many relationship between actors and religions, and `etl_runs` is a standalone audit log.
+
+### Loading into PostgreSQL:
+
+`load.py` runs after transformation and loads one daily folder at a time:
+
+1. Create the tables, keys and indexes if they don't exist (safe to rerun).
+2. For each `data/transformed/YYYYMMDD/` folder, in date order, open one transaction.
+3. Load the parent tables first (`event_types`, `actors`, `locations`,
+   `actor_religions`), then `events`, so every foreign key has a parent.
+4. Each table is copied with `COPY` into a staging table, then inserted with
+   primary-key conflict handling. Existing dimension rows are left unchanged;
+   an event is updated only if the incoming `dateadded` is newer.
+5. Record the day's quality report in `etl_runs`, then commit.
+6. If any step fails, that day rolls back and earlier days stay loaded.
+
+Because loads are upserts, rerunning or overlapping date ranges never creates
+duplicate rows.
+
 
 ## Run the complete stack
 
@@ -348,9 +363,28 @@ dashboard additions.
 and filters, save it as `docs/images/dashboard.png`, and embed it below before
 submission.
 
-<!-- Enable after a real dashboard screenshot is supplied:
-![GDELT dashboard charts and interactive filters](docs/images/dashboard.png)
--->
+<table>
+  <tr>
+    <td align="center">
+      <img src="docs/images/Dashboard_preview_1.png" alt="Dashboard Preview Q1" width="450"><br>
+      <sub>Dashboard preview 1</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/Dashboard_preview_2.png" alt="Dashboard Preview Q2" width="450"><br>
+      <sub>Dashboard preview 2</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/Dashboard_preview_3.png" alt="Dashboard Preview Q3" width="450"><br>
+      <sub>Dashboard preview 3</sub>
+    </td>
+    <td align="center">
+      <img src="docs/images/Dashboard_preview_4.png" alt="Dashboard Preview Q4" width="450"><br>
+      <sub>Dashboard preview 4</sub>
+    </td>
+  </tr>
+</table>
 
 ## Six-month CSV collection in Docker
 
