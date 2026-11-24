@@ -21,12 +21,21 @@ from local CSV batches and daily transformation reports on November 16, 2026.
 Counts come from `data/transformed/YYYYMMDD/quality_report.json`; raw file counts
 and sizes come from `data/batches/*.csv`. These describe collected files, rather
 than a verified count of distinct records loaded into PostgreSQL. Dimension rows
-can recur across daily exports; use the dashboard's **Data quality** tab for
-database table counts. Storage figures exclude PostgreSQL, indexes, Docker images,
+can recur across daily exports; query PostgreSQL directly for database table
+counts. Storage figures exclude PostgreSQL, indexes, Docker images,
 backups, and temporary files.
 
-The collection covers six calendar months of **archive publication times**.
-`SQLDATE` is the event date and can fall outside that publication window.
+The research collection above covers six calendar months of **archive publication
+times**. It is the previously collected dataset used for analysis and dashboard
+screenshots.
+
+**Testing extraction window:** As agreed with our TAs, the default testing
+configuration uses a rolling **two-day extraction window** (`LOOKBACK_DAYS=2`).
+A fresh run with these settings collects that smaller window; it does not
+recreate the six-month research dataset above. The number of rows returned
+depends on the selected dates and GDELT activity.
+
+`SQLDATE` is the event date and can fall outside the archive publication window.
 GDELT publishes Events archives every 15 minutes; see the
 [official event codebook](https://data.gdeltproject.org/documentation/GDELT-Event_Codebook-V2.0.pdf).
 Generated data is ignored by Git: cloning the repository does not copy the
@@ -115,21 +124,23 @@ The team's Phase 1 questions guide the analysis:
 | --- | --- |
 | 1. Correlation between religions and human-rights organizations | Most-mentioned religions and organizations; most frequent religion/organization pairs. |
 | 2a. Compare the volume and themes of coverage involving major religions | Religion coverage and average tone over time; top five event types involving religion. |
-| 2b. Distinguish religious reporting from rights-violation coverage | Separate general religious coverage from rights-related candidates and compare trends; the final operational definition remains to be agreed. |
+| 2b. Distinguish religious reporting from rights-violation coverage | Compare religion-coded only, rights-related only, and overlapping events using actor religion codes and the selected rights-related CAMEO codes. |
 | 3. Compare how the Iran Oil Crisis affects countries | Countries interacting most with Iran and the cooperation/conflict patterns of those interactions. |
 | 4a. Where are protests associated with escalation? | Average Goldstein score by country for protest reports, alongside subsequent higher-impact events. |
 | 4b. Where are protests associated with change? | Common subsequent responses, such as concessions, arrests, and force. |
 
-**Dashboard work is ongoing.** Current views provide event/tone/Goldstein trends,
-topic flags, countries, maps, sources, and quality reports. Religion and
-organization rankings/pairs, religion-specific trends, Iran partner-country
-comparisons, and protest-response sequences are not yet dedicated views in the
-current `streamlit_app.py`. Alejandro and Tony are working on the dashboards.
+The completed dashboard, developed by Tony, organizes these questions into five
+research views: religions and rights organizations, religion coverage, religion
+versus rights, Iran and oil, and protests. Each view combines charts with
+explanations of its measures. The Dashboard section below describes the views
+and interactive controls.
 
 Cooccurrence counts alone do not establish correlation. Average Goldstein scores
 for protest-coded reports do not establish that protests caused later escalation
-or change. The response questions require explicit event-linking/time-window
-rules; country/location links also do not directly measure economic oil impacts.
+or change. Protest-response comparisons use the same country on protest days
+with at least five protest events and the following two days; these are temporal
+associations rather than links between individual incidents. Country/location
+links also do not directly measure economic oil impacts.
 
 ## PostgreSQL schema and ERD
 
@@ -181,8 +192,9 @@ duplicate rows.
 
 Prerequisites: Git, Docker Desktop (or Docker Engine with Compose), internet
 access to GDELT, and enough disk space for CSVs and PostgreSQL. The measured CSV
-footprint is approximately 19.14 GB before database storage. Initial collection
-of six months can take a long time.
+footprint of the earlier six-month research collection is approximately 19.14 GB
+before database storage. The standard two-day run collects less data; its disk
+usage depends on news volume and database storage.
 
 1. Clone the repository and enter its directory:
 
@@ -203,11 +215,19 @@ of six months can take a long time.
    `.env` is ignored by Git. Compose enforces the internal database host/port
    for Python services.
 
-   `LOOKBACK_MONTHS=6` selects six calendar months in UTC. An explicit
-   `LOOKBACK_DAYS` overrides it for shorter tests; remove old day overrides for
-   the full collection. Optional `EXTRACT_START` / `EXTRACT_END` set fixed
-   `YYYYMMDDHHMMSS` archive boundaries: start exclusive, end inclusive.
-   Leave both blank for rolling collection through the newest archive.
+   Set the agreed two-day testing window:
+
+   ```dotenv
+   LOOKBACK_DAYS=2
+   INCLUDE_MENTIONS=false
+   EXTRACT_START=
+   EXTRACT_END=
+   ```
+
+   Clear any previous fixed `EXTRACT_START` / `EXTRACT_END` values so they do not
+   override the rolling window. An explicit `LOOKBACK_DAYS=2` takes precedence
+   over an older local `LOOKBACK_MONTHS` setting. Six-month research collection
+   is not required for the standard startup.
 
 3. Start the full stack with the assignment's command:
 
@@ -251,7 +271,7 @@ or the configured lookback; `saved_timestamps()` lists completed local CSVs.
 
 Extraction selects timestamps in `(start, end]`, reuses completed batches, and
 downloads missing archives inside the window, including gaps before newer cached
-files. CLI `--start` / `--end` override the environment boundaries. Downloads
+files. The standard configuration selects a two-day lookback in UTC. Downloads
 use retries/backoff and published MD5 checks; malformed records are quarantined.
 Network failures or logged archive gaps stop extraction and prevent the next ETL
 script from running. Investigate `data/skipped_events.txt` before retrying:
@@ -305,8 +325,8 @@ Transformation prints input/cleaned rows, duplicates, quarantines, and per-colum
 missing/invalid/derived counts. Loading prints rows read and **combined
 inserted/updated** counts per table; separate insert and update totals required
 by the assignment are not yet reported. Daily `quality_report.json` and
-`rejected_events.csv` preserve evidence; successful load reports also appear in
-PostgreSQL and the dashboard.
+`rejected_events.csv` preserve evidence; successful load reports are also stored
+in PostgreSQL's `etl_runs` table.
 
 ### Tests and logs
 
@@ -326,7 +346,7 @@ docker compose run --rm --no-deps etl python -m pytest -q
 Tests use hand-built records and mocked HTTP responses. They cover cleaning,
 missing-value policies, code preservation, stable keys/relationships, daily
 batching, extraction windows/cache behavior, failure handling, and sample
-validation. They do not prove a full six-month Docker run or database-driven
+validation. They do not prove complete Docker startup or a database-driven
 incremental restart. [tests/README.md](tests/README.md) describes optional real
 GDELT sample validation.
 
@@ -340,79 +360,68 @@ it does not validate the complete extraction or dashboard.
 
 ## Dashboard
 
-The app reads PostgreSQL through SQLAlchemy and offers event-date, action-country,
-and topic filters. Multiple selected topic flags combine with AND. The default
-date range is the latest 30 days in the loaded data. Analytical filters use bound
-SQL parameters.
+The app reads PostgreSQL through SQLAlchemy. Use the horizontal navigation to
+switch research views, and expand the sidebar for event-date, action-country,
+religion, and human-rights organization filters. The default date range is the
+latest 182 days of loaded event dates; the slider covers at most the latest 400
+days. Display controls group denominations into world religions, switch between
+event counts and summed media mentions, and select daily, weekly, or monthly
+trends. SQL filter values are bound parameters.
 
-| Tab | Current views |
+| Research view | Visualizations and analysis |
 | --- | --- |
-| Overview | Daily event volume, average tone, average Goldstein score, quad-class counts. |
-| Topics | Daily flagged-event counts and leading CAMEO root categories; the category query joins `events` and `event_types`. |
-| Geography | Leading action countries and a map of up to 1,000 places, joining `events` and `locations`. |
-| Sources & events | Source-domain rankings and a most-covered-events table joining event types and locations. |
-| Data quality | Whole-database table counts and quality reports for loaded days. |
+| Q1 · Religions × rights orgs | Religion and organization rankings, religion coverage over time, frequent pairs, a sunburst, and a pairing heatmap. Queries join `events`, `actors`, and `actor_religions`. |
+| Q2a · Religion coverage | Volume versus tone, coverage and tone trends for the five leading religions in the selection, and the top five event types. Taxonomy queries join `event_types`. |
+| Q2b · Religion vs. rights | Overlap metrics, coverage trends, tone/Goldstein comparisons, relative group sizes, and event-type comparisons for religion-only, rights-only, and overlapping events. |
+| Q3 · Iran & oil | Partner-country event counts and Goldstein rankings/maps, Iran and oil-candidate coverage/tone trends, and action-country coverage maps. Partner queries join both actor profiles. |
+| Q4 · Protests | Country Goldstein rankings/maps, volume versus conflict level, and concession/arrest/repression/coercion/force comparisons within protest windows, including response-rate lift versus other days. |
 
 Coverage counts reflect news reporting and GDELT coding, rather than independent
-counts of all real-world events. See the research-question table for planned
-dashboard additions.
+counts of all real-world events. Rights and oil classifications remain heuristic;
+the charts do not establish that protests caused subsequent responses.
 
-### Dashboard screenshot
+### Dashboard screenshots
 
-**Pending actual screenshot:** capture the running dashboard with visible charts
-and filters, save it as `docs/images/dashboard.png`, and embed it below before
-submission.
+The screenshots below show the running dashboard's research views and
+interactive filters using the previously collected research dataset.
 
 <table>
   <tr>
     <td align="center">
       <img src="docs/images/Dashboard_preview_1.png" alt="Dashboard Preview Q1" width="450"><br>
-      <sub>Dashboard preview 1</sub>
+      <sub>Q1 · Religions × rights organizations</sub>
     </td>
     <td align="center">
-      <img src="docs/images/Dashboard_preview_2.png" alt="Dashboard Preview Q2" width="450"><br>
-      <sub>Dashboard preview 2</sub>
+      <img src="docs/images/Dashboard_preview_2.png" alt="Dashboard Preview Q2b: Religion vs. rights" width="450"><br>
+      <sub>Q2b · Religion vs. rights</sub>
     </td>
   </tr>
   <tr>
     <td align="center">
       <img src="docs/images/Dashboard_preview_3.png" alt="Dashboard Preview Q3" width="450"><br>
-      <sub>Dashboard preview 3</sub>
+      <sub>Q3 · Iran &amp; oil</sub>
     </td>
     <td align="center">
       <img src="docs/images/Dashboard_preview_4.png" alt="Dashboard Preview Q4" width="450"><br>
-      <sub>Dashboard preview 4</sub>
+      <sub>Q4 · Protests</sub>
     </td>
   </tr>
 </table>
 
-## Six-month CSV collection in Docker
+## CSV collection in Docker
 
 This workflow preserves raw CSVs and daily exports on the host for inspection and
-retrying. It does not load PostgreSQL or launch the dashboard. With Docker
-running and `.env` configured:
+retrying. It does not load PostgreSQL or launch the dashboard. Use the same
+two-day settings shown in the startup instructions. With Docker running and
+`.env` configured:
 
 ```sh
 docker compose build etl
 docker compose run --rm --no-deps etl python -m pytest -q
 ```
 
-For repeatable collection, set fixed UTC boundaries in `.env`. For example,
-`EXTRACT_START=20260515000000` and `EXTRACT_END=20261115000000` span six calendar
-months; these example boundaries differ from the measured snapshot above.
-Keep the boundaries unchanged when retrying the same collection.
-
-Preview the archive count, cache, and compressed download estimate:
-
-```sh
-docker compose run --rm --no-deps \
-  --volume "$PWD/data:/app/data" \
-  etl python extract.py --dry-run
-```
-
-The preview reads the index without downloading/saving archives. Compressed
-traffic estimates do not include the larger extracted CSV footprint.
-Download and transform one reporting day at a time:
+Download the configured archive window, then transform the cached batches one
+reporting day at a time:
 
 ```sh
 docker compose run --rm --no-deps \
@@ -442,7 +451,7 @@ docker compose run --rm --no-deps \
 | `extract.py` | Index selection, HTTP downloads, validation, timestamped raw batches. |
 | `transform.py` | Cleaning, features, normalized daily CSVs, quality reports. |
 | `load.py` | Schema creation, transactions, conflict handling, load audit. |
-| `streamlit_app.py` | Database-backed charts, filters, quality views. |
+| `streamlit_app.py` | Five database-backed research views, charts, and interactive filters. |
 | `tests/`, `scripts/` | Unit tests, Docker connection check, GDELT sample validation. |
 | `Dockerfile`, `docker-compose.yml` | Python image and database/ETL/dashboard services. |
 | `requirements.in`, `requirements.txt` | Direct dependencies and pinned packages. |
@@ -455,8 +464,5 @@ docker compose run --rm --no-deps \
 | --- | --- |
 | Maya Brumbalow | Extraction implementation, building presentation, transformation changes, dashboard planning. |
 | Peyton Kocher | Daily GDELT processing, validation tests, Docker setup, infrastructure checks. |
-| Tony (Anastacio) Moreno | PostgreSQL loading, pgAdmin schema/ERD, and dashboard development. |
-| Alejandro Rojo | Transformation, repository integration/documentation, and dashboard development. |
-
-Before finalizing, add Tony's ERD and a real dashboard screenshot, and update
-the dashboard scope and rerun documentation as the remaining implementation lands.
+| Tony (Anastacio) Moreno | PostgreSQL loading, database schema/pgAdmin work, and completed dashboard development. |
+| Alejandro Rojo | Transformation, repository integration/documentation, and ERD export/README integration. |
